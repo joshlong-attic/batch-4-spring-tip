@@ -1,60 +1,66 @@
 package com.example;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
 import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
 import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
-import org.springframework.batch.item.ItemReader;
-import org.springframework.batch.item.ItemWriter;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
 import org.springframework.batch.item.database.JdbcBatchItemWriter;
+import org.springframework.batch.item.database.JdbcCursorItemReader;
 import org.springframework.batch.item.database.builder.JdbcBatchItemWriterBuilder;
+import org.springframework.batch.item.database.builder.JdbcCursorItemReaderBuilder;
 import org.springframework.batch.item.file.FlatFileItemReader;
+import org.springframework.batch.item.file.FlatFileItemWriter;
 import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
+import org.springframework.batch.item.file.builder.FlatFileItemWriterBuilder;
+import org.springframework.batch.item.file.transform.DelimitedLineAggregator;
+import org.springframework.beans.factory.InjectionPoint;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.batch.JobExecutionEvent;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.context.event.EventListener;
 import org.springframework.core.io.Resource;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
 import javax.sql.DataSource;
 import java.io.File;
+import java.util.Collections;
+import java.util.Map;
 
 @SpringBootApplication
 @EnableBatchProcessing
 public class BatchDemoJavaApplication {
 
+	@Bean
+	Log log(InjectionPoint ip) {
+		return LogFactory.getLog(ip.getMember().getDeclaringClass());
+	}
+
 	public static class Person {
+
 		private int age;
-		private String name, email;
+		private String firstName, email;
 
 		public int getAge() {
 			return age;
 		}
 
-		@Override
-		public String toString() {
-			return "Person{" +
-					"age=" + age +
-					", name='" + name + '\'' +
-					", email='" + email + '\'' +
-					'}';
+		public String getFirstName() {
+			return firstName;
+		}
+
+		public void setFirstName(String firstName) {
+			this.firstName = firstName;
 		}
 
 		public void setAge(int age) {
 			this.age = age;
-		}
-
-		public String getName() {
-			return name;
-		}
-
-		public void setName(String name) {
-			this.name = name;
 		}
 
 		public String getEmail() {
@@ -68,74 +74,123 @@ public class BatchDemoJavaApplication {
 		public Person() {
 		}
 
-		public Person(int age, String name, String email) {
+		@Override
+		public String toString() {
+			return "Person{" +
+					"age=" + age +
+					", firstName='" + firstName + '\'' +
+					", email='" + email + '\'' +
+					'}';
+		}
+
+		public Person(int age, String firstName, String email) {
 			this.age = age;
-			this.name = name;
+			this.firstName = firstName;
 			this.email = email;
 		}
 	}
 
-	@Bean
-	FlatFileItemReader<Person> fileReader(@Value("${dailyFile}") Resource resource) throws Exception {
-		return new FlatFileItemReaderBuilder<Person>()
-				.name("csv-to-person")
-				.resource(resource)
-				.targetType(Person.class)
-				.delimited().delimiter(",").names("name,age,email".split(","))
-				.build();
+	@Configuration
+	public static class Step1Configuration {
+
+		@Bean
+		FlatFileItemReader<Person> csvReader(@Value("${input}") Resource resource) throws Exception {
+			return new FlatFileItemReaderBuilder<Person>()
+					.name("csv-to-person")
+					.resource(resource)
+					.targetType(Person.class)
+					.delimited().delimiter(",").names("firstName,age,email".split(","))
+					.build();
+		}
+
+		@Bean
+		JdbcBatchItemWriter<Person> jdbcWriter(DataSource dataSource) {
+			return new JdbcBatchItemWriterBuilder<Person>()
+					.beanMapped()
+					.dataSource(dataSource)
+					.sql("insert into PEOPLE( FIRST_NAME, AGE, EMAIL) values ( :firstName, :age, :email)")
+					.build();
+		}
 	}
 
-	@Bean
-	JdbcBatchItemWriter<Person> jdbcWriter(DataSource dataSource) {
-		return new JdbcBatchItemWriterBuilder<Person>()
-				.beanMapped()
-				.dataSource(dataSource)
-				.sql("insert into PEOPLE( NAME, AGE, EMAIL) values ( :name, :age, :email)")
-				.build();
+
+	@Configuration
+	public static class Step2Configuration {
+
+		@Bean
+		JdbcCursorItemReader<Map<Integer, Integer>> jdbcReader(DataSource dataSource) {
+			return new JdbcCursorItemReaderBuilder<Map<Integer, Integer>>()
+					.name("counts-to-map")
+					.dataSource(dataSource)
+					.sql("select COUNT(*) count, AGE age from PEOPLE group by AGE")
+					.rowMapper((rs, i) -> Collections.singletonMap(
+							rs.getInt("age"), rs.getInt("count")))
+					.build();
+		}
+
+		@Bean
+		FlatFileItemWriter<Map<Integer, Integer>> csvWriter(@Value("${output}") Resource output) {
+			DelimitedLineAggregator<Map<Integer, Integer>> lineAggregator = new DelimitedLineAggregator<>();
+			lineAggregator.setFieldExtractor(integerIntegerMap -> {
+				Integer key = integerIntegerMap.keySet().iterator().next();
+				return new Object[]{key, integerIntegerMap.get(key)};
+			});
+			return new FlatFileItemWriterBuilder<Map<Integer, Integer>>()
+					.name("distribution-writer")
+					.resource(output)
+					.lineAggregator(lineAggregator)
+					.build();
+		}
 	}
 
+
 	@Bean
-	Job job(JobBuilderFactory jbf,
+	Job job(Log log,
+	        JobBuilderFactory jbf,
 	        StepBuilderFactory sbf,
-	        ItemReader<Person> ir,
-	        ItemWriter<Person> iw) {
+	        Step1Configuration step1,
+	        Step2Configuration step2) throws Exception {
 
-		Step step1 = sbf.get("csv-to-db")
+		Step s1 = sbf.get("csv-to-db")
 				.<Person, Person>chunk(10)
-				.reader(ir)
-				.writer(iw)
+				.reader(step1.csvReader(null))
+				.writer(step1.jdbcWriter(null))
+				.build();
+
+		Step s2 = sbf.get("db-to-xml")
+				.<Map<Integer, Integer>, Map<Integer, Integer>>chunk(10)
+				.reader(step2.jdbcReader(null))
+				.writer(step2.csvWriter(null))
 				.build();
 
 		return jbf.get("etl")
-				.flow(step1)
-				.end()
+				.incrementer(new RunIdIncrementer())
+				.start(s1)
+				.next(s2)
 				.build();
 	}
 
 	@Component
 	public static class JobListener {
 
-		private final JdbcTemplate jdbcTemplate;
+		private final Log log;
 
-		public JobListener(JdbcTemplate jdbcTemplate) {
-			this.jdbcTemplate = jdbcTemplate;
+		public JobListener(Log log) {
+			this.log = log;
 		}
 
 		@EventListener(JobExecutionEvent.class)
 		public void onEvent(JobExecutionEvent executionEvent) {
-			this.jdbcTemplate
-					.query("select * from PEOPLE", (res, i) -> new Person(
-							res.getInt("AGE"),
-							res.getString("NAME"),
-							res.getString("EMAIL")))
-					.forEach(System.out::println);
+			this.log.info(executionEvent.toString());
 		}
 	}
 
 
 	public static void main(String[] args) {
-		System.setProperty("dailyFile", "file://" +
+		System.setProperty("input", "file://" +
 				new File("/Users/jlong/Desktop/in.csv").getAbsolutePath());
+		System.setProperty("output", "file://" +
+				new File("/Users/jlong/Desktop/out.csv").getAbsolutePath());
 		SpringApplication.run(BatchDemoJavaApplication.class, args);
 	}
 }
