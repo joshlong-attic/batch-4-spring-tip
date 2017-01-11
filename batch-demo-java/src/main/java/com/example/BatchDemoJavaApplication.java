@@ -131,9 +131,9 @@ public class BatchDemoJavaApplication {
 		@Bean
 		FlatFileItemWriter<Map<Integer, Integer>> csvWriter(@Value("${output}") Resource output) {
 			DelimitedLineAggregator<Map<Integer, Integer>> lineAggregator = new DelimitedLineAggregator<>();
-			lineAggregator.setFieldExtractor(integerIntegerMap -> {
-				Integer key = integerIntegerMap.keySet().iterator().next();
-				return new Object[]{key, integerIntegerMap.get(key)};
+			lineAggregator.setFieldExtractor(countAvgMap -> {
+				Integer key = countAvgMap.keySet().iterator().next();
+				return new Object[]{key, countAvgMap.get(key)};
 			});
 			return new FlatFileItemWriterBuilder<Map<Integer, Integer>>()
 					.name("distribution-writer")
@@ -145,11 +145,11 @@ public class BatchDemoJavaApplication {
 
 
 	@Bean
-	Job job(Log log,
-	        JobBuilderFactory jbf,
-	        StepBuilderFactory sbf,
-	        Step1Configuration step1,
-	        Step2Configuration step2) throws Exception {
+	Job job(
+			JobBuilderFactory jbf,
+			StepBuilderFactory sbf,
+			Step1Configuration step1,
+			Step2Configuration step2) throws Exception {
 
 		Step s1 = sbf.get("csv-to-db")
 				.<Person, Person>chunk(10)
